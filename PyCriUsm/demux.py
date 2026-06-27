@@ -45,6 +45,34 @@ def _decrypt_usm(usm_decrypter: UsmCrypter, hca_decrypter, input_queue: SimpleQu
 		output_queue.put(buffer)
 
 
+def iter_ordered_chunks(queue: SimpleQueue):
+	chunk_cache = {}
+	next_index = 0
+	max_index = None
+	while True:
+		data = queue.get(timeout=1)
+		if isinstance(data, int):
+			if data < next_index:
+				raise ValueError("DEBUG: expect chunk index is higher than chunk total number")
+			max_index = data
+		else:
+			if data.index < next_index:
+				raise ValueError("DEBUG:there're some logic problems in write_file")
+			chunk_cache[data.index] = data
+
+		while True:
+			ordered = chunk_cache.pop(next_index, None)
+			if ordered is None:
+				break
+			yield ordered
+			next_index += 1
+
+		if max_index is not None and next_index == max_index:
+			if chunk_cache:
+				raise ValueError("DEBUG: it seems that receiving is over but there's still some chunk in cache")
+			break
+
+
 def demux(video_path, output: Union[str, Path, SimpleQueue], key=0, audio_encrypt=False, hca_encrypt=0,
 		  is_async=False, filter_mode=0, audio_chno=(), video_chno=()):
 	"""
@@ -61,7 +89,7 @@ def demux(video_path, output: Union[str, Path, SimpleQueue], key=0, audio_encryp
 	def write_loop(queue: SimpleQueue, output):
 		def write_cache(cache, data):
 			buffer = reg_dict(cache, data.chno, BytesIO)
-			write_file(buffer, data)
+			buffer.write(data)
 
 		def write_file_from_cache(cache, suffix):
 			ret = {}
@@ -72,71 +100,21 @@ def demux(video_path, output: Union[str, Path, SimpleQueue], key=0, audio_encryp
 					f.write(buffer.getbuffer())
 			return ret
 
-		def write_file(fobj, data):
-			nonlocal finish_flag
-			index = data.index
-			if index == chunk_cache[0]:
-				fobj.write(data)
-				new_index = index + 1
-				while True:
-					data = chunk_cache[1].pop(new_index, None)
-					if data is None:
-						break
-					if fobj.write(data) != data.size:
-						breakpoint()
-					new_index += 1
-				chunk_cache[0] = new_index
-				if max_index is not None:
-					if new_index == max_index:
-						if chunk_cache[1]:
-							ValueError("DEBUG: it seems that receiving is over but there's still some chunk in cache")
-						else:
-							finish_flag = True
-					elif new_index > max_index:
-						raise ValueError("DEBUG: number of chunks provided seems to be not as same as received")
-			elif index > chunk_cache[0]:
-				chunk_cache[1][index] = data
-			for i in chunk_cache[1]:
-				if i < chunk_cache[0]:
-					raise ValueError("DEBUG:there're some logic problems in write_file")
-
 		logger = getLogger('PyCriUsm.writer')
 		logger.debug(r'success enter write function')
 		memory_cache = ({}, {})
-		chunk_cache = [0, {}]
 		stream_video_path = None
 		stream_video = None
-		max_index = None
-		finish_flag = False
-		# await write_lock.acquire(1)
-		while True:
-			data = queue.get(timeout=1)
-			# check
-			if isinstance(data, int):
-				if data == chunk_cache[0]:
-					break
-				elif data < chunk_cache[0]:
-					ValueError("DEBUG: expect chunk index is higher than chunk total number")
-				max_index = data
-				continue
+		for data in iter_ordered_chunks(queue):
 			if data.is_video and data.chno == 0:
 				if stream_video_path is None:
 						stream_video_path = output / (video_path.stem + '.ivf')
 						stream_video = stream_video_path.open('wb')
-				write_file(stream_video, data)
+				stream_video.write(data)
 			else:
 				write_cache(memory_cache[data.is_video], data)
-			del data
-			if finish_flag:
-				break
 
 		logger.debug(f'writing {video_path} finished')
-		# check logic
-		for b in chunk_cache[1].values():
-			if b[1]:
-				ValueError("there're some chunks in cache when reading finish")
-
-		# write cache to file
 		if stream_video:
 			stream_video.close()
 		logger.debug('start writing audio cache to file')
